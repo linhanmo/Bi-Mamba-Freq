@@ -1,1 +1,1 @@
-# Bi-Mamba-Freq
+# Bi-Mamba-Freq Experiments Code

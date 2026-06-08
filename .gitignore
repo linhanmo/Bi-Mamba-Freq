@@ -1,5 +1,8 @@
 datasets/
-/__pycache__/
 **/*.npz
 data/
 .vscode/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class

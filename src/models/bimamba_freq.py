@@ -1,13 +1,22 @@
 import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mambapy.mamba import RMSNorm
-from mambapy.pscan import pscan
+try:
+    from mambapy.mamba import RMSNorm
+    from mambapy.pscan import pscan
+except ImportError:
+    mamba_src = Path(__file__).resolve().parents[1] / "mamba"
+    if str(mamba_src) not in sys.path:
+        sys.path.append(str(mamba_src))
+    from mambapy.mamba import RMSNorm
+    from mambapy.pscan import pscan
 
 
 def _inverse_softplus(x: torch.Tensor) -> torch.Tensor:

@@ -3,6 +3,7 @@ from .bimamba_freq import (
     BiMambaFreqConfig,
     BiMambaFreqModel,
     LowRankLinear,
+    bimamba_freq_multitask_loss,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "BiMambaFreqConfig",
     "BiMambaFreqModel",
     "LowRankLinear",
+    "bimamba_freq_multitask_loss",
 ]

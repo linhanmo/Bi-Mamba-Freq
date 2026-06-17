@@ -1,4 +1,5 @@
 # Bi-Mamba-Freq Experiments Code
+
 ```bash
 conda create -n mamba python=3.9 -y
 conda activate mamba
@@ -9,3 +10,4 @@ cd mamba.py
 pip install -e .
 cd ..
 ```
+

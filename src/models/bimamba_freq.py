@@ -342,12 +342,20 @@ class BiMambaFreq(nn.Module):
         BX = deltaB * x.unsqueeze(-1)
 
         h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=x.device, dtype=x.dtype)
-        hs = []
-        for t in range(length):
-            h = deltaA[:, t] * h + BX[:, t]
-            hs.append(h)
-        hs_tensor = torch.stack(hs, dim=1)
-        y = (hs_tensor @ C.unsqueeze(-1)).squeeze(3)
+        if return_states:
+            hs = []
+            for t in range(length):
+                h = deltaA[:, t] * h + BX[:, t]
+                hs.append(h)
+            hs_tensor = torch.stack(hs, dim=1)
+            y = (hs_tensor @ C.unsqueeze(-1)).squeeze(3)
+        else:
+            ys = []
+            for t in range(length):
+                h = deltaA[:, t] * h + BX[:, t]
+                ys.append((h @ C[:, t].unsqueeze(-1)).squeeze(2))
+            hs_tensor = None
+            y = torch.stack(ys, dim=1)
         y = y + D * x
         return y, hs_tensor if return_states else None
 

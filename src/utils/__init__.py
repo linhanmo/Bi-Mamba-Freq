@@ -1,5 +1,5 @@
 from .early_stopping import EarlyStopping
-from .experiments import create_experiment_dir, save_json
+from .experiments import create_experiment_dir, save_json, to_jsonable
 from .metrics import (
     classification_metrics,
     forecast_metrics,
@@ -17,5 +17,5 @@ __all__ = [
     "regression_metrics",
     "save_json",
     "seed_everything",
+    "to_jsonable",
 ]
-

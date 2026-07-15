@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .datasets import preprocess_csv_dataset
+from .datasets import preprocess_csv_dataset, resolve_dataset_defaults
 
 
 DATASET_FILES: Dict[str, str] = {
@@ -23,12 +23,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-root", type=Path, default=Path("data"))
     p.add_argument("--datasets", nargs="*", default=["all"])
     p.add_argument("--seq-len", type=int, default=96)
-    p.add_argument("--pred-len", type=int, default=24)
+    p.add_argument("--pred-len", type=int, default=96)
     p.add_argument("--stride", type=int, default=1)
-    p.add_argument("--train-ratio", type=float, default=0.7)
-    p.add_argument("--val-ratio", type=float, default=0.2)
-    p.add_argument("--time-features", choices=["none", "simple"], default="simple")
+    p.add_argument("--train-ratio", type=float, default=None)
+    p.add_argument("--val-ratio", type=float, default=None)
+    p.add_argument("--time-features", choices=["none", "simple"], default=None)
     p.add_argument("--format", choices=["full", "windows"], default="full")
+    p.add_argument("--normalize", choices=["auto", "on", "off"], default="auto")
     return p
 
 
@@ -47,16 +48,26 @@ def main(argv: Optional[List[str]] = None) -> None:
             raise SystemExit(f"Missing dataset file: {csv_path}")
         out_dir = args.out_root / name
         try:
+            defaults = resolve_dataset_defaults(
+                dataset_name=name,
+                pred_len=args.pred_len,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+                time_features=args.time_features,
+                normalize=args.normalize,
+            )
             result = preprocess_csv_dataset(
                 csv_path=csv_path,
                 out_dir=out_dir,
                 seq_len=args.seq_len,
-                pred_len=args.pred_len,
+                pred_len=defaults["pred_len"],
                 stride=args.stride,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                time_features=args.time_features,
+                train_ratio=defaults["train_ratio"],
+                val_ratio=defaults["val_ratio"],
+                time_features=defaults["time_features"],
                 output_format=args.format,
+                dataset_name=name,
+                normalize=defaults["normalize"],
             )
             print(f"{name}: saved {result.series_path} and {result.meta_path}")
         except Exception as e:

@@ -1,8 +1,13 @@
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .finmultitime import preprocess_finmultitime_dataset
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from preprocess.finmultitime import preprocess_finmultitime_dataset
+else:
+    from .finmultitime import preprocess_finmultitime_dataset
 
 
 def _slugify_market_name(name: str) -> str:

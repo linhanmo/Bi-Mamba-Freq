@@ -1,0 +1,14 @@
+numpy
+pandas
+tqdm
+einops
+pytest
+jupyter 
+notebook
+wandb
+dvc
+pyarrow
+hydra-core
+matplotlib
+scikit-learn
+causal-conv1d

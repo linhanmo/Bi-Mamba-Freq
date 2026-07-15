@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 Split = Literal["train", "val", "test"]
 OutputFormat = Literal["full", "windows"]
 TimeFeatures = Literal["none", "simple"]
+NormalizeMode = Literal["auto", "on", "off"]
 
 
 def _try_import_pandas():
@@ -109,6 +110,27 @@ class PreprocessResult:
     meta_path: Path
 
 
+def resolve_dataset_defaults(
+    dataset_name: Optional[str],
+    pred_len: int = 96,
+    train_ratio: Optional[float] = None,
+    val_ratio: Optional[float] = None,
+    time_features: Optional[TimeFeatures] = None,
+    normalize: NormalizeMode = "auto",
+) -> Dict[str, Any]:
+    name = (dataset_name or "").lower()
+    is_ett = name.startswith("etth") or name.startswith("ettm")
+    return {
+        "pred_len": pred_len,
+        "train_ratio": 0.6 if train_ratio is None and is_ett else (0.7 if train_ratio is None else train_ratio),
+        "val_ratio": 0.2 if val_ratio is None and is_ett else (0.1 if val_ratio is None else val_ratio),
+        "time_features": "none" if time_features is None else time_features,
+        "normalize": normalize,
+        "split_scheme": "6:2:2" if is_ett else "7:1:2",
+        "is_ett": is_ett,
+    }
+
+
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +158,30 @@ def _compute_standardizer(train_values):
     var = [max(0.0, (sq_sums[j] / n) - (mean[j] * mean[j])) for j in range(d)]
     std = [(v**0.5 if v > 0 else 1.0) for v in var]
     return mean, std
+
+
+def _series_statistics(values) -> Tuple[float, float, float]:
+    np = _try_import_numpy()
+    if np is not None and hasattr(values, "__array__"):
+        mean_abs = float(np.abs(values.mean(axis=0)).mean())
+        std_mean = float(values.std(axis=0, ddof=0).mean())
+        max_abs = float(np.abs(values).max())
+        return mean_abs, std_mean, max_abs
+
+    flat = [[float(v) for v in row] for row in values]
+    d = len(flat[0])
+    n = len(flat)
+    means = [sum(row[j] for row in flat) / n for j in range(d)]
+    vars_ = [sum((row[j] - means[j]) ** 2 for row in flat) / n for j in range(d)]
+    mean_abs = sum(abs(v) for v in means) / d
+    std_mean = sum(v**0.5 for v in vars_) / d
+    max_abs = max(abs(v) for row in flat for v in row)
+    return float(mean_abs), float(std_mean), float(max_abs)
+
+
+def _looks_already_standardized(values) -> bool:
+    mean_abs, std_mean, max_abs = _series_statistics(values)
+    return mean_abs < 0.75 and 0.5 <= std_mean <= 2.5 and max_abs <= 8.0
 
 
 def _apply_standardizer(values, mean, std):
@@ -235,14 +281,29 @@ def preprocess_csv_dataset(
     csv_path: Path,
     out_dir: Path,
     seq_len: int = 96,
-    pred_len: int = 24,
+    pred_len: int = 96,
     stride: int = 1,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.2,
-    time_features: TimeFeatures = "simple",
+    train_ratio: Optional[float] = None,
+    val_ratio: Optional[float] = None,
+    time_features: Optional[TimeFeatures] = None,
     output_format: OutputFormat = "full",
+    dataset_name: Optional[str] = None,
+    normalize: NormalizeMode = "auto",
 ) -> PreprocessResult:
     _ensure_dir(out_dir)
+    resolved = resolve_dataset_defaults(
+        dataset_name=dataset_name or csv_path.stem,
+        pred_len=pred_len,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        time_features=time_features,
+        normalize=normalize,
+    )
+    pred_len = int(resolved["pred_len"])
+    train_ratio = float(resolved["train_ratio"])
+    val_ratio = float(resolved["val_ratio"])
+    time_features = resolved["time_features"]
+    normalize = resolved["normalize"]
     dt_list, feats, values, columns = load_csv_time_series(csv_path, time_features=time_features)
     np = _try_import_numpy()
     if np is not None and hasattr(values, "ndim"):
@@ -259,10 +320,23 @@ def preprocess_csv_dataset(
     splits = _split_indices(total_length, train_ratio=train_ratio, val_ratio=val_ratio)
     train_start, train_end = splits["train"]
     train_values = values[train_start:train_end]
-    mean, std = _compute_standardizer(train_values)
-    values_scaled = _apply_standardizer(values, mean, std)
+    skip_standardization = normalize == "off" or (normalize == "auto" and _looks_already_standardized(values))
+    if skip_standardization:
+        if np is not None and hasattr(values, "__array__"):
+            mean = np.zeros(n_features, dtype=np.float32)
+            std = np.ones(n_features, dtype=np.float32)
+        else:
+            mean = [0.0] * n_features
+            std = [1.0] * n_features
+        values_scaled = values.astype(np.float32) if np is not None and hasattr(values, "__array__") else values
+        normalization_applied = "skipped"
+    else:
+        mean, std = _compute_standardizer(train_values)
+        values_scaled = _apply_standardizer(values, mean, std)
+        normalization_applied = "zscore"
 
     meta: Dict[str, object] = {
+        "dataset_name": dataset_name or csv_path.stem,
         "source_csv": str(csv_path),
         "columns": columns,
         "total_length": int(total_length),
@@ -270,9 +344,15 @@ def preprocess_csv_dataset(
         "seq_len": int(seq_len),
         "pred_len": int(pred_len),
         "stride": int(stride),
+        "train_ratio": float(train_ratio),
+        "val_ratio": float(val_ratio),
+        "split_scheme": resolved["split_scheme"],
         "splits": {k: [int(a), int(b)] for k, (a, b) in splits.items()},
         "time_features": time_features,
         "output_format": output_format,
+        "normalize": normalize,
+        "normalization_applied": normalization_applied,
+        "already_standardized_detected": bool(skip_standardization and normalize == "auto"),
         "scaler": {
             "mean": mean.tolist() if hasattr(mean, "tolist") else list(mean),
             "std": std.tolist() if hasattr(std, "tolist") else list(std),

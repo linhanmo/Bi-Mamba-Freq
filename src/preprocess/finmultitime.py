@@ -69,6 +69,78 @@ def _as_numpy(values: Any):
     return np.asarray(values, dtype=np.float32)
 
 
+def _sanitize_numeric_series(values: Any, default: float = 0.0, min_value: Optional[float] = None):
+    np = _try_import_numpy()
+    if np is not None and hasattr(values, "__array__"):
+        arr = np.asarray(values, dtype=np.float32).copy()
+        finite_mask = np.isfinite(arr)
+        if finite_mask.any():
+            first_valid = int(np.flatnonzero(finite_mask)[0])
+            arr[:first_valid] = arr[first_valid]
+            for idx in range(first_valid + 1, arr.shape[0]):
+                if not np.isfinite(arr[idx]):
+                    arr[idx] = arr[idx - 1]
+        else:
+            arr.fill(default)
+        arr = np.nan_to_num(arr, nan=default, posinf=default, neginf=default)
+        if min_value is not None:
+            arr = np.clip(arr, min_value, None)
+        return arr.astype(np.float32)
+
+    cleaned: List[float] = []
+    last_valid = default
+    seen_valid = False
+    for value in values:
+        v = float(value)
+        if math.isfinite(v):
+            last_valid = v
+            seen_valid = True
+        cleaned.append(last_valid if seen_valid else default)
+    if min_value is not None:
+        cleaned = [max(v, min_value) for v in cleaned]
+    return cleaned
+
+
+def _sanitize_feature_matrix(features: Any):
+    np = _try_import_numpy()
+    if np is not None and hasattr(features, "__array__"):
+        arr = np.asarray(features, dtype=np.float32).copy()
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        return arr.astype(np.float32)
+    return [[0.0 if not math.isfinite(float(v)) else float(v) for v in row] for row in features]
+
+
+def _stabilize_model_features(features: Any, clip_value: float = 20.0):
+    np = _try_import_numpy()
+    cleaned = _sanitize_feature_matrix(features)
+    if np is not None and hasattr(cleaned, "__array__"):
+        arr = np.asarray(cleaned, dtype=np.float32)
+        return np.clip(arr, -clip_value, clip_value).astype(np.float32)
+    clipped: List[List[float]] = []
+    for row in cleaned:
+        clipped.append([max(-clip_value, min(clip_value, float(v))) for v in row])
+    return clipped
+
+
+def _sanitize_raw_ohlcv(ohlcv: Any):
+    np = _try_import_numpy()
+    if np is not None and hasattr(ohlcv, "__array__"):
+        arr = np.asarray(ohlcv, dtype=np.float32).copy()
+        for col in range(min(arr.shape[1], 4)):
+            arr[:, col] = _sanitize_numeric_series(arr[:, col], default=1e-8, min_value=1e-8)
+        if arr.shape[1] > 4:
+            arr[:, 4] = _sanitize_numeric_series(arr[:, 4], default=0.0, min_value=0.0)
+        return arr.astype(np.float32)
+    columns = list(zip(*ohlcv))
+    cleaned = []
+    for col_idx, column in enumerate(columns):
+        if col_idx < 4:
+            cleaned.append(_sanitize_numeric_series(column, default=1e-8, min_value=1e-8))
+        else:
+            cleaned.append(_sanitize_numeric_series(column, default=0.0, min_value=0.0))
+    return [list(row) for row in zip(*cleaned)]
+
+
 def _column_array(values: Any, columns: Sequence[str], column_name: str):
     idx = list(columns).index(column_name)
     np = _try_import_numpy()
@@ -93,54 +165,81 @@ def _stack_features(columns: List[Any]):
 
 
 def _build_finance_features(values: Any, columns: Sequence[str]) -> Tuple[Any, Any, List[str]]:
-    np = _try_import_numpy()
     selected = _select_finance_columns(columns)
     open_price = _column_array(values, columns, selected["open"])
     high_price = _column_array(values, columns, selected["high"])
     low_price = _column_array(values, columns, selected["low"])
     close_price = _column_array(values, columns, selected["close"])
     volume = _column_array(values, columns, selected["volume"])
-    dividends = _column_array(values, columns, selected["dividends"]) if "dividends" in selected else _zeros_like(close_price)
-    stock_splits = (
-        _column_array(values, columns, selected["stock_splits"]) if "stock_splits" in selected else _zeros_like(close_price)
-    )
-
-    eps = 1e-8
-    if np is not None and hasattr(close_price, "__array__"):
-        prev_close = np.concatenate([close_price[:1], close_price[:-1]], axis=0)
-        log_return = np.log(np.clip(close_price, eps, None) / np.clip(prev_close, eps, None)).astype(np.float32)
-        log_return[0] = 0.0
-        oc_return = ((close_price - open_price) / np.clip(open_price, eps, None)).astype(np.float32)
-        hl_spread = ((high_price - low_price) / np.clip(close_price, eps, None)).astype(np.float32)
-    else:
-        prev_close = [close_price[0]] + close_price[:-1]
-        log_return = [
-            0.0 if i == 0 else math.log(max(float(close_price[i]), eps) / max(float(prev_close[i]), eps))
-            for i in range(len(close_price))
-        ]
-        oc_return = [
-            (float(close_price[i]) - float(open_price[i])) / max(float(open_price[i]), eps) for i in range(len(close_price))
-        ]
-        hl_spread = [
-            (float(high_price[i]) - float(low_price[i])) / max(float(close_price[i]), eps) for i in range(len(close_price))
-        ]
-
-    feature_names = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "dividends",
-        "stock_splits",
-        "log_return",
-        "open_close_return",
-        "high_low_spread",
-    ]
-    feature_matrix = _stack_features(
-        [open_price, high_price, low_price, close_price, volume, dividends, stock_splits, log_return, oc_return, hl_spread]
-    )
+    feature_names = ["open", "high", "low", "close", "volume"]
+    feature_matrix = _stack_features([open_price, high_price, low_price, close_price, volume])
     return feature_matrix, close_price, feature_names
+
+
+def _trailing_ohlcv_matrix(ohlcv: Any, window: int):
+    np = _try_import_numpy()
+    if np is not None and hasattr(ohlcv, "__array__"):
+        out = np.empty_like(ohlcv, dtype=np.float32)
+        for i in range(ohlcv.shape[0]):
+            seg = ohlcv[max(0, i - window + 1) : i + 1]
+            out[i, 0] = float(seg[0, 0])
+            out[i, 1] = float(seg[:, 1].max())
+            out[i, 2] = float(seg[:, 2].min())
+            out[i, 3] = float(seg[-1, 3])
+            out[i, 4] = float(seg[:, 4].sum())
+        return out
+
+    out: List[List[float]] = []
+    for i in range(len(ohlcv)):
+        seg = ohlcv[max(0, i - window + 1) : i + 1]
+        out.append(
+            [
+                float(seg[0][0]),
+                max(float(row[1]) for row in seg),
+                min(float(row[2]) for row in seg),
+                float(seg[-1][3]),
+                sum(float(row[4]) for row in seg),
+            ]
+        )
+    return out
+
+
+def _concat_multiscale_ohlcv(ohlcv: Any, week_length: int = 5, month_length: int = 21):
+    np = _try_import_numpy()
+    weekly = _trailing_ohlcv_matrix(ohlcv, week_length)
+    monthly = _trailing_ohlcv_matrix(ohlcv, month_length)
+    feature_names = [
+        "day_open",
+        "day_high",
+        "day_low",
+        "day_close",
+        "day_volume",
+        "week_open",
+        "week_high",
+        "week_low",
+        "week_close",
+        "week_volume",
+        "month_open",
+        "month_high",
+        "month_low",
+        "month_close",
+        "month_volume",
+    ]
+    if np is not None and hasattr(ohlcv, "__array__"):
+        return np.concatenate([ohlcv, weekly, monthly], axis=1).astype(np.float32), feature_names
+    return [list(ohlcv[i]) + list(weekly[i]) + list(monthly[i]) for i in range(len(ohlcv))], feature_names
+
+
+def _rightmost_leq(sorted_values: Sequence[Any], target: Any) -> int:
+    lo = 0
+    hi = len(sorted_values)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_values[mid] <= target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
 
 def _count_windows(start: int, end: int, seq_len: int, pred_len: int, stride: int) -> int:
@@ -189,6 +288,52 @@ def preprocess_finmultitime_dataset(
     if not csv_files:
         raise ValueError(f"No csv files found under {data_root}")
 
+    records: List[Dict[str, Any]] = []
+    calendar_dates = set()
+    feature_names: List[str] = []
+    for csv_path in csv_files:
+        dt_list, time_feat, values, columns = load_csv_time_series(csv_path, time_features=time_features)
+        values = _as_numpy(values)
+        raw_ohlcv, close_price, _ = _build_finance_features(values, columns)
+        raw_ohlcv = _as_numpy(raw_ohlcv)
+        close_price = _as_numpy(close_price)
+        raw_ohlcv = _sanitize_raw_ohlcv(raw_ohlcv)
+        close_price = _sanitize_numeric_series(close_price, default=1e-8, min_value=1e-8)
+        multiscale_features, multiscale_names = _concat_multiscale_ohlcv(raw_ohlcv)
+        multiscale_features = _as_numpy(multiscale_features)
+        multiscale_features = _sanitize_raw_ohlcv(multiscale_features)
+        if time_feat is not None:
+            time_feat = _as_numpy(time_feat)
+            time_feat = _sanitize_feature_matrix(time_feat)
+        total_length = multiscale_features.shape[0] if hasattr(multiscale_features, "shape") else len(multiscale_features)
+        min_required = seq_len + pred_len + 1
+        if total_length < min_required:
+            continue
+        if dt_list:
+            calendar_dates.update(dt_list)
+        if not feature_names:
+            feature_names = list(multiscale_names)
+        records.append(
+            {
+                "csv_path": csv_path,
+                "ticker": csv_path.stem,
+                "dt_list": dt_list,
+                "time_features": time_feat,
+                "features": multiscale_features,
+                "close": close_price,
+            }
+        )
+
+    if not records:
+        raise ValueError("No valid ticker series found after preprocessing")
+
+    calendar = sorted(calendar_dates)
+    if not calendar:
+        raise ValueError("FinMultitime data requires timestamps for market-wide temporal splitting")
+    split_dates = _split_indices(len(calendar), train_ratio=train_ratio, val_ratio=val_ratio)
+    train_date = calendar[max(split_dates["train"][1] - 1, 0)]
+    val_date = calendar[max(split_dates["val"][1] - 1, 0)]
+
     manifest: Dict[str, Any] = {
         "market": market_name,
         "market_type": market_type,
@@ -198,37 +343,45 @@ def preprocess_finmultitime_dataset(
         "stride": stride,
         "train_ratio": train_ratio,
         "val_ratio": val_ratio,
+        "split_scheme": f"{int(train_ratio*10)}:{int(val_ratio*10)}:{int((1.0-train_ratio-val_ratio)*10)}",
         "time_features": time_features,
         "vol_scale": vol_scale,
         "task_definition": {
-            "classification": "Binary label, 1 if future close at t+pred_len is higher than the last close in the input window.",
-            "volatility": "Realized volatility computed as std(log returns over the future horizon) * sqrt(vol_scale).",
+            "classification": "Binary label, 1 if next-day log return is positive.",
+            "volatility": "log1p(realized volatility) where realized volatility is sqrt(vol_scale * sum of squared log returns over the trailing vol window).",
+        },
+        "split_boundary_dates": {
+            "train_end": train_date.isoformat(),
+            "val_end": val_date.isoformat(),
         },
         "tickers": [],
-        "feature_names": [],
+        "feature_names": feature_names,
         "split_window_counts": {"train": 0, "val": 0, "test": 0},
     }
 
-    for csv_path in csv_files:
-        dt_list, time_feat, values, columns = load_csv_time_series(csv_path, time_features=time_features)
-        values = _as_numpy(values)
-        feature_matrix, close_price, feature_names = _build_finance_features(values, columns)
-        feature_matrix = _as_numpy(feature_matrix)
-        close_price = _as_numpy(close_price)
-        if time_feat is not None:
-            time_feat = _as_numpy(time_feat)
-
-        total_length = feature_matrix.shape[0] if hasattr(feature_matrix, "shape") else len(feature_matrix)
-        min_required = seq_len + pred_len + 1
-        if total_length < min_required:
+    for record in records:
+        dt_list = record["dt_list"]
+        time_feat = record["time_features"]
+        feature_matrix = record["features"]
+        close_price = record["close"]
+        if dt_list:
+            train_end = _rightmost_leq(dt_list, train_date)
+            val_end = _rightmost_leq(dt_list, val_date)
+        else:
+            train_end = int(len(feature_matrix) * train_ratio)
+            val_end = int(len(feature_matrix) * (train_ratio + val_ratio))
+        splits = {
+            "train": (0, train_end),
+            "val": (train_end, val_end),
+            "test": (val_end, len(feature_matrix)),
+        }
+        if train_end < seq_len + 1:
             continue
-
-        splits = _split_indices(total_length, train_ratio=train_ratio, val_ratio=val_ratio)
-        train_start, train_end = splits["train"]
-        scaler_mean, scaler_std = _compute_standardizer(feature_matrix[train_start:train_end])
+        scaler_mean, scaler_std = _compute_standardizer(feature_matrix[:train_end])
         features_scaled = _apply_standardizer(feature_matrix, scaler_mean, scaler_std)
+        features_scaled = _stabilize_model_features(features_scaled)
 
-        ticker = csv_path.stem
+        ticker = record["ticker"]
         ticker_file = ticker_dir / f"{ticker}.npz"
         payload = {
             "features": features_scaled,
@@ -258,11 +411,9 @@ def preprocess_finmultitime_dataset(
                 "window_counts": split_window_counts,
             }
         )
-        if not manifest["feature_names"]:
-            manifest["feature_names"] = feature_names
 
     if not manifest["tickers"]:
-        raise ValueError("No valid ticker series found after preprocessing")
+        raise ValueError("No valid ticker series remained after applying market-wide split boundaries")
 
     meta_path = out_root / "manifest.json"
     meta_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -312,14 +463,6 @@ class FinMultiTimeMultiTaskDataset:
     def __len__(self) -> int:
         return self.cumulative_counts[-1] if self.cumulative_counts else 0
 
-    def _feature_index(self, name: str, *fallback_names: str) -> int:
-        feature_names = self.manifest["feature_names"]
-        candidates = (name,) + fallback_names
-        for candidate in candidates:
-            if candidate in feature_names:
-                return feature_names.index(candidate)
-        raise ValueError(f"None of the feature names {candidates} exist in manifest feature_names")
-
     def _load_payload(self, file_path: str) -> Dict[str, Any]:
         if self._cache_file == file_path and self._cache_payload is not None:
             return self._cache_payload
@@ -334,9 +477,9 @@ class FinMultiTimeMultiTaskDataset:
             raw = np.load(path, allow_pickle=False)
             time_features = raw["time_features"]
             payload = {
-                "features": raw["features"],
-                "close": raw["close"],
-                "time_features": None if time_features.size == 0 else time_features,
+                "features": _stabilize_model_features(raw["features"]),
+                "close": _sanitize_numeric_series(raw["close"], default=1e-8, min_value=1e-8),
+                "time_features": None if time_features.size == 0 else _sanitize_feature_matrix(time_features),
                 "splits": {
                     "train": tuple(int(v) for v in raw["splits_train"].tolist()),
                     "val": tuple(int(v) for v in raw["splits_val"].tolist()),
@@ -345,85 +488,51 @@ class FinMultiTimeMultiTaskDataset:
             }
         else:
             payload = pickle.loads(path.read_bytes())
+            payload["features"] = _stabilize_model_features(payload["features"])
+            payload["close"] = _sanitize_numeric_series(payload["close"], default=1e-8, min_value=1e-8)
+            if payload.get("time_features") is not None:
+                payload["time_features"] = _sanitize_feature_matrix(payload["time_features"])
 
         self._cache_file = file_path
         self._cache_payload = payload
         return payload
 
-    def _compute_targets(self, close_history: Any, target_close: float) -> Tuple[float, float]:
+    def _compute_targets(self, close_history: Any, current_close: float, target_close: float) -> Tuple[float, float]:
         np = _try_import_numpy()
         eps = 1e-8
-        anchor_close = float(close_history[-1])
-        y_cls = 1.0 if float(target_close) > anchor_close else 0.0
+        current_close = float(current_close)
+        target_close = float(target_close)
+        if (not math.isfinite(current_close)) or current_close <= 0.0:
+            current_close = eps
+        if (not math.isfinite(target_close)) or target_close <= 0.0:
+            target_close = eps
+        y_cls = 1.0 if math.log(target_close / current_close) > 0.0 else 0.0
         if len(close_history) == 0:
             return y_cls, 0.0
         if np is not None and hasattr(close_history, "__array__"):
             close_with_target = np.concatenate(
-                [np.asarray(close_history, dtype=np.float32), np.asarray([target_close], dtype=np.float32)], axis=0
+                [np.asarray(close_history, dtype=np.float32), np.asarray([current_close, target_close], dtype=np.float32)], axis=0
             )
+            close_with_target = np.nan_to_num(close_with_target, nan=eps, posinf=eps, neginf=eps)
             close_with_target = np.clip(close_with_target, eps, None)
             log_returns = np.diff(np.log(close_with_target))
             if log_returns.shape[0] > self.vol_window:
                 log_returns = log_returns[-self.vol_window :]
-            y_vol = float(math.sqrt(self.vol_scale * float((log_returns**2).sum())))
+            y_vol = float(math.log1p(math.sqrt(self.vol_scale * float((log_returns**2).sum()))))
         else:
-            log_returns = [
-                math.log(max(float(close_history[i]), eps) / max(float(close_history[i - 1]), eps))
-                for i in range(1, len(close_history))
-            ]
-            log_returns.append(math.log(max(float(target_close), eps) / max(float(close_history[-1]), eps)))
+            cleaned = []
+            for value in close_history:
+                v = float(value)
+                if (not math.isfinite(v)) or v <= 0.0:
+                    v = eps
+                cleaned.append(v)
+            log_returns = [math.log(cleaned[i] / cleaned[i - 1]) for i in range(1, len(cleaned))]
+            log_returns.append(math.log(current_close / cleaned[-1]))
+            log_returns.append(math.log(target_close / current_close))
             if len(log_returns) > self.vol_window:
                 log_returns = log_returns[-self.vol_window :]
-            y_vol = math.sqrt(self.vol_scale * sum(v * v for v in log_returns))
+            y_vol = math.log1p(math.sqrt(self.vol_scale * sum(v * v for v in log_returns)))
         return y_cls, y_vol
-
-    def _trailing_ohlcv(self, ohlcv: Any, window: int):
-        np = _try_import_numpy()
-        if np is not None and hasattr(ohlcv, "__array__"):
-            out = np.empty_like(ohlcv, dtype=np.float32)
-            for i in range(ohlcv.shape[0]):
-                seg = ohlcv[max(0, i - window + 1) : i + 1]
-                out[i, 0] = float(seg[0, 0])
-                out[i, 1] = float(seg[:, 1].max())
-                out[i, 2] = float(seg[:, 2].min())
-                out[i, 3] = float(seg[-1, 3])
-                out[i, 4] = float(seg[:, 4].sum())
-            return out
-
-        out: List[List[float]] = []
-        for i in range(len(ohlcv)):
-            seg = ohlcv[max(0, i - window + 1) : i + 1]
-            open_v = float(seg[0][0])
-            high_v = max(float(row[1]) for row in seg)
-            low_v = min(float(row[2]) for row in seg)
-            close_v = float(seg[-1][3])
-            vol_v = sum(float(row[4]) for row in seg)
-            out.append([open_v, high_v, low_v, close_v, vol_v])
-        return out
-
-    def _build_model_input(self, payload: Dict[str, Any], start: int):
-        features = payload["features"]
-        o = self._feature_index("open")
-        h = self._feature_index("high")
-        l = self._feature_index("low")
-        c = self._feature_index("close")
-        v = self._feature_index("volume", "log_volume")
-        ohlcv = features[:, [o, h, l, c, v]] if hasattr(features, "__array__") else [
-            [row[o], row[h], row[l], row[c], row[v]] for row in features
-        ]
-        x_day = ohlcv[start : start + self.seq_len]
-        if not self.use_multiscale_ohlcv:
-            return x_day
-
-        week_all = self._trailing_ohlcv(ohlcv, self.week_length)
-        month_all = self._trailing_ohlcv(ohlcv, self.month_length)
-        x_week = week_all[start : start + self.seq_len]
-        x_month = month_all[start : start + self.seq_len]
-
-        np = _try_import_numpy()
-        if np is not None and hasattr(x_day, "__array__"):
-            return np.concatenate([x_day, x_week, x_month], axis=1).astype(np.float32)
-        return [list(x_day[i]) + list(x_week[i]) + list(x_month[i]) for i in range(len(x_day))]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if idx < 0 or idx >= len(self):
@@ -436,12 +545,13 @@ class FinMultiTimeMultiTaskDataset:
         start = split_start + local_idx * self.stride
 
         payload = self._load_payload(ticker_info["file"])
-        features = self._build_model_input(payload, start)
+        features = payload["features"][start : start + self.seq_len]
         target_index = start + self.seq_len
-        close_history_start = max(0, target_index - self.vol_window)
+        close_history_start = max(0, target_index - self.vol_window - 1)
         close_history = payload["close"][close_history_start:target_index]
+        current_close = float(payload["close"][target_index - 1])
         target_close = float(payload["close"][target_index])
-        y_cls, y_vol = self._compute_targets(close_history, target_close)
+        y_cls, y_vol = self._compute_targets(close_history, current_close, target_close)
 
         sample: Dict[str, Any] = {
             "x": features,
